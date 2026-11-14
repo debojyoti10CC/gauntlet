@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {CustomRevert} from "v4-core/libraries/CustomRevert.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
@@ -30,7 +31,9 @@ contract GauntletHookTest is Test, Deployers {
         deployFreshManagerAndRouters();
         deployMintAndApprove2Currencies();
 
-        address flags = address(uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG) ^ (0x4444 << 144));
+        address flags = address(
+            uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_DONATE_FLAG) ^ (0x4444 << 144)
+        );
         GauntletHook.Config memory cfg = GauntletHook.Config({
             epochLength: 1 hours,
             winStreak: 2,
@@ -280,6 +283,111 @@ contract GauntletHookTest is Test, Deployers {
         vm.prank(alice);
         vm.expectRevert(GauntletHook.BondTooSmall.selector);
         hook.register("x", WIDE_L, WIDE_U, 1e18);
+    }
+
+    // ---------------- donations ----------------
+    function test_donationsAreBlocked() public {
+        _registerBase();
+        // a donation would raise feeGrowthInside for every in-range probe without a single swap
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CustomRevert.WrappedError.selector,
+                address(hook),
+                IHooks.beforeDonate.selector,
+                abi.encodeWithSelector(GauntletHook.DonationsDisabled.selector),
+                abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+            )
+        );
+        donateRouter.donate(key, 100e18, 100e18, ZERO_BYTES);
+    }
+
+    // ---------------- benchmark ----------------
+    function _registerBenchmark() internal returns (uint256 id) {
+        vm.prank(dave);
+        id = hook.registerBenchmark("Benchmark", WIDE_L, WIDE_U);
+    }
+
+    function test_benchmarkStartsFlatAndIsImmovable() public {
+        _registerBase();
+        uint256 b = _registerBenchmark();
+        assertTrue(hook.hasBenchmark());
+        assertEq(hook.benchmarkId(), b);
+        assertApproxEqRel(hook.curatorNav(b), hook.INITIAL_NAV(), 1e12);
+
+        // nobody owns it: it can't be moved or exited
+        vm.prank(dave);
+        vm.expectRevert(GauntletHook.NotCuratorOwner.selector);
+        hook.declareRange(b, -600, 600);
+        vm.prank(dave);
+        vm.expectRevert(GauntletHook.NotCuratorOwner.selector);
+        hook.exit(b);
+    }
+
+    function test_onlyOneBenchmark() public {
+        _registerBase();
+        _registerBenchmark();
+        vm.prank(carol);
+        vm.expectRevert(GauntletHook.BenchmarkExists.selector);
+        hook.registerBenchmark("Another", -1200, 1200);
+    }
+
+    function test_benchmarkNeverTakesTheSeat() public {
+        // benchmark sits on a tight range, so it would out-earn the wide incumbent if it were allowed to compete
+        vm.prank(alice);
+        uint256 inc = hook.register("Wide Alice", WIDE_L, WIDE_U, 100e18);
+        vm.prank(dave);
+        uint256 b = hook.registerBenchmark("Tight benchmark", TIGHT_L, TIGHT_U);
+        for (uint256 i; i < 4; ++i) {
+            _trade(20, 50e18);
+            _nextEpoch();
+        }
+        assertEq(hook.incumbentId(), inc, "benchmark is not a challenger");
+        GauntletHook.CuratorView[] memory cs = hook.getCurators();
+        assertTrue(cs[b].benchmark);
+        assertEq(cs[b].streak, 0);
+        assertGt(cs[b].nav, cs[inc].nav, "it did earn more, it just can't win");
+    }
+
+    function test_benchmarkReportTracksVaultAndBenchmark() public {
+        _registerBase();
+        _registerBenchmark();
+        vm.prank(dave);
+        hook.deposit(10_000e18, 10_000e18, 0);
+
+        (uint256 v0,, uint256 b0,) = hook.benchmarkReport();
+        assertApproxEqRel(v0, 1e18, 1e12, "vault starts flat");
+        assertApproxEqRel(b0, 1e18, 1e12, "benchmark starts flat");
+
+        _trade(20, 50e18);
+        (uint256 vs, uint256 ve, uint256 bs, uint256 be) = hook.benchmarkReport();
+        assertGt(vs, 1e18, "vault earned fees");
+        assertGt(bs, 1e18, "benchmark earned fees");
+        assertEq(vs, ve, "first epoch: since-start equals this-epoch");
+        assertEq(bs, be);
+
+        // vault and benchmark are on the same wide range here, so they should track each other closely
+        assertApproxEqRel(vs, bs, 0.002e18);
+
+        _nextEpoch();
+        (, uint256 veAfter,, uint256 beAfter) = hook.benchmarkReport();
+        assertApproxEqRel(veAfter, 1e18, 1e12, "epoch baseline rolled for the vault");
+        assertApproxEqRel(beAfter, 1e18, 1e12, "and for the benchmark");
+    }
+
+    function test_benchmarkDoesNotUseACuratorSlot() public {
+        _registerBenchmark();
+        // 8 real curators still fit alongside the benchmark
+        for (uint256 i; i < 8; ++i) {
+            address u = address(uint160(0x1000 + i));
+            MockERC20(Currency.unwrap(currency0)).transfer(u, 10e18);
+            MockERC20(Currency.unwrap(currency1)).transfer(u, 1_000e18);
+            vm.startPrank(u);
+            MockERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
+            MockERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
+            hook.register("c", WIDE_L, WIDE_U, 100e18);
+            vm.stopPrank();
+        }
+        assertEq(hook.curatorCount(), 9);
     }
 
     function test_badRangeReverts() public {

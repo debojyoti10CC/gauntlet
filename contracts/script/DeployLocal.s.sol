@@ -63,7 +63,7 @@ contract DeployLocal is Script {
             maxTickDeviation: 300,
             minBond: 100e18
         });
-        uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG);
+        uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_DONATE_FLAG);
         bytes memory hookInit = abi.encodePacked(type(GauntletHook).creationCode, abi.encode(manager, cfg));
         bytes32 hookSalt;
         for (uint256 s;; ++s) {
@@ -122,6 +122,10 @@ contract DeployLocal is Script {
         hook.register("Tight Tony", _round(startTick - 300), _round(startTick + 300), 500e18); // ~ +-3%
         vm.broadcast(PK3);
         hook.register("Mid Mia", _round(startTick - 1020), _round(startTick + 960), 500e18); // ~ +-10%
+
+        // the passive reference the vault is judged against: a wide range (~ -50% .. +50%) that never moves
+        vm.broadcast(PK4);
+        hook.registerBenchmark("Benchmark", _round(startTick - 6960), _round(startTick + 4080));
 
         // seed the vault
         vm.broadcast(PK4);

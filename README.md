@@ -37,14 +37,46 @@ The seat holder is scored the same way as everyone else (its own paper portfolio
 | Join late in an epoch with a lucky streak | A challenger must be present for the **whole** epoch to be eligible. |
 | Spam the leaderboard | Bond required, max 8 curators. |
 | Carry wins earned against the old seat holder into the new reign | All streaks reset on takeover. |
+| Pump a range's score with `donate()`, which adds fee growth without any swap | The hook claims `beforeDonate` and reverts every donation to its pool (`DonationsDisabled`). |
 
-Known limitation, said out loud: a curator could wash-trade to inflate fee growth at their range. It costs them the swap fees, which go to *real* liquidity in that range, and any range overlapping theirs benefits too. A production version would cap per-epoch fee credit or weight fees by unique swappers.
+Known limitations, said out loud:
+
+- **Wash trading.** A curator could wash-trade to inflate fee growth at their range. Unlike a donation, it costs them the swap fee plus price impact, and the fees go to *real* liquidity in that range. Any range overlapping theirs benefits too. A production version would cap per-epoch fee credit or weight fees by unique swappers.
+- **Price pushed across a block boundary.** The block-open snapshot only happens on a block's first swap. In a block with no swap yet, the reference price is the current spot. So someone could push the price at the end of block N and call `settleEpoch()` first thing in block N+1. That costs them a block of arbitrage exposure. A production version would settle against a multi-block average or a snapshot from several blocks back.
 
 ## What the demo shows
 
 Hit **Trade in a range** a few times and the tight curator out-earns the wide one on fees. Settle three epochs and you'll watch the seat change hands and the vault bar slide to the new range. Then hit **Pump tETH**: the price walks out of the tight range, it goes hatched (earning nothing), and the wide-range curator leads the next epoch. The market regime decides who should manage, and the hook figures it out by itself.
 
+The grey lane is the **benchmark**: the same 1,000 tUSD paper portfolio, parked on a fixed wide range that never moves and can never take the seat. Every settlement emits `BenchmarkScored` with the vault's real return next to the benchmark's, and the Vault panel shows both since the start and for the current epoch. That answers the depositor's question directly: is the contested seat beating doing nothing?
+
 ![Pump](docs/pump.png)
+
+## Keeper-free settlement (Reactive Network)
+
+`settleEpoch()` is permissionless, but someone still has to call it. `src/reactive/` removes that someone:
+
+- **`GauntletReactive`** runs on Reactive Network. It subscribes to one of Reactive's built-in CRON events and, every `ticksPerPoke` ticks, emits a callback to the hook's chain.
+- **`GauntletKeeper`** runs on the hook's chain. It only accepts callbacks from the Reactive callback proxy *and* from our own reactive contract's RVM id. If the epoch is over it settles it, otherwise it emits `Idle`. A failed settle is reported (`SettleFailed`) and retried on the next tick, so it can't block the schedule.
+
+The keeper has no special rights on the hook. All it adds is liveness: the seat changes hands on time even when nobody is watching. A takeover settle uses under 1.5M gas, half the 3M callback budget (checked in the tests).
+
+Deploy (Unichain Sepolia + Reactive Lasna), from the **same** EOA so the RVM id matches:
+
+```bash
+cd contracts
+# 1. keeper on the hook's chain, with Unichain Sepolia's Reactive callback proxy, funded for callback fees
+forge create src/reactive/GauntletKeeper.sol:GauntletKeeper --broadcast \
+  --rpc-url https://sepolia.unichain.org --private-key $PRIVATE_KEY --value 0.01ether \
+  --constructor-args 0x775c9B990ADe401060B78D0e98684eEf8d2466C1 $HOOK false
+
+# 2. reactive contract on Lasna: Cron100 (~12 min), poke every tick, destination chain 1301
+forge create src/reactive/GauntletReactive.sol:GauntletReactive --broadcast \
+  --rpc-url https://lasna-rpc.rnk.dev/ --private-key $PRIVATE_KEY --value 0.1ether \
+  --constructor-args 0xb49937fb8970e19fd46d48f7e3fb00d659deac0347f79cd7cb542f0fc1503c70 1301 $KEEPER 1
+```
+
+Callback proxy addresses and CRON topics come from the [Reactive docs](https://dev.reactive.network/origins-and-destinations). Check them before deploying.
 
 ---
 
@@ -61,7 +93,7 @@ Then open http://localhost:5173. That one command:
 1. starts a local anvil chain
 2. deploys a PoolManager, tETH/tUSD test tokens, swap and LP routers, and the hook at a flag-mined CREATE2 address
 3. creates a tETH/tUSD pool at about 3,000 with deep background liquidity
-4. seeds three curators (Passive Pam ±40% holds the seat, Tight Tony ±3%, Mid Mia ±10%) and a vault deposit
+4. seeds three curators (Passive Pam ±40% holds the seat, Tight Tony ±3%, Mid Mia ±10%), a fixed wide-range benchmark and a vault deposit
 5. starts the frontend
 
 **On Windows:** run `./demo.sh` from WSL (Ubuntu) with Foundry and Node installed there. Or split it: run `anvil --host 0.0.0.0` and the deploy steps from `demo.sh` inside WSL, then start the frontend from Windows with `cd frontend && npm install && npx vite`. WSL forwards `127.0.0.1:8545` to Windows, so the frontend reaches anvil. The frontend reads the RPC URL from `VITE_RPC_URL` (default `http://127.0.0.1:8545`).
@@ -75,13 +107,16 @@ cd contracts
 forge test
 ```
 
-18 tests, covering:
+31 tests, covering:
 - the probe measuring fees
 - a takeover after the streak
 - slashing going to depositors
 - a trending market favouring the wide range
 - in-block manipulation being ignored
+- donations being rejected by the hook
+- the benchmark: starts flat, can't be moved, exited or seated, tracks the vault, doesn't use a curator slot
 - deposit/withdraw round trips
+- the Reactive keeper: no-op mid-epoch, settles an ended epoch, drives a full takeover alone, rejects foreign callers and foreign RVM ids, settle fits the callback gas budget
 - all the access-control reverts
 
 ### Testnet
@@ -93,7 +128,7 @@ POOL_MANAGER=0x00b036b58a818b1bc34d502d3fe730db729e62ac \
 forge script script/DeployTestnet.s.sol --rpc-url https://sepolia.unichain.org --broadcast
 ```
 
-That's the Unichain Sepolia PoolManager. Sepolia, Base Sepolia and Arbitrum Sepolia addresses are in the script header. It deploys test tokens, the hook, routers, a pool with liquidity and a "Genesis" seat holder, and writes `deployments/<chainId>.json`.
+That's the Unichain Sepolia PoolManager. Sepolia, Base Sepolia and Arbitrum Sepolia addresses are in the script header. It deploys test tokens, the hook, routers, a pool with liquidity, a "Genesis" seat holder and the benchmark, and writes `deployments/<chainId>.json`.
 
 ---
 
@@ -102,7 +137,8 @@ That's the Unichain Sepolia PoolManager. Sepolia, Base Sepolia and Arbitrum Sepo
 ```
 contracts/
   src/GauntletHook.sol     the hook, the vault (ERC20 shares) and the curator registry, in one contract
-  test/GauntletHook.t.sol  18 Foundry tests
+  src/reactive/            GauntletReactive (Reactive Network CRON) + GauntletKeeper (callback, settles epochs)
+  test/                    31 Foundry tests (hook + reactive keeper)
   script/DeployLocal.s.sol local world with seeded curators
   script/DeployTestnet.s.sol deploy against a real v4 PoolManager
 frontend/                  Vite + React + viem dashboard
@@ -110,7 +146,7 @@ scripts/export_abi.py      copies ABIs into the frontend
 demo.sh                    one-command demo
 ```
 
-**Hook permissions:** `afterInitialize` (bind to one pool) and `beforeSwap` (snapshot the block-open price). That's it: the hook never touches swap pricing, so traders pay normal v4 fees and the pool stays a normal pool.
+**Hook permissions:** `afterInitialize` (bind to one pool), `beforeSwap` (snapshot the block-open price) and `beforeDonate` (reject donations, which would otherwise inflate scores). That's it: the hook never touches swap pricing, so traders pay normal v4 fees.
 
 **Position layout inside the PoolManager**, all owned by the hook and separated by salt:
 
@@ -139,16 +175,18 @@ NAV      = value(position + fees + cash, blockOpenPrice)    // in tUSD
 | `deposit / withdraw` | depositors | ERC20 vault shares priced at the block-open price |
 | `exit(id)` | challenger | leave and reclaim your bond |
 | `compound()` | anyone | reinvest the vault's collected fees |
+| `registerBenchmark(name, lower, upper)` | anyone, once | set the passive reference range. No owner, no bond, never competes. |
+| `benchmarkReport()` | view | vault vs benchmark growth, since start and this epoch |
 
 ## Mapped to the judging criteria
 
 | Criterion | Weight | Where Gauntlet scores |
 |---|---|---|
-| Original idea | 30% | Using dust probe positions to make v4 track fees at hypothetical ranges is, as far as we found, new. No hook in the UHI directory does on-chain forward-testing of LP strategies or contested curation. |
-| Unique execution | 25% | Pure v4 primitives (`getFeeGrowthInside`, salted positions, the unlock callback). No oracle, no keeper, no off-chain service. Manipulation-resistant block-open pricing. |
-| Impact | 20% | Turns "trust the manager" into "the manager is whoever is actually winning". Depositors get automatic manager replacement plus slashed bonds. Strategists get a permissionless way to prove skill without capital. |
-| Functionality | 15% | 18 passing tests, one-command demo, a full lifecycle with real swaps on a real PoolManager. |
-| Presentation | 10% | Live dashboard: lanes view, standings with sparklines, on-chain event log. |
+| Original idea | 30% | Auction-managed AMM hooks (Chronus, Maestro, Turnstile in the UHI directory) *sell* the manager seat to the highest bidder. Gauntlet makes curators *earn* it with measured LP performance. Using dust probe positions to make v4 track fees at hypothetical ranges is, as far as we found, new. |
+| Unique execution | 25% | Pure v4 primitives (`getFeeGrowthInside`, salted positions, the unlock callback). No oracle, no off-chain service. Manipulation-resistant block-open pricing, donations blocked at the hook. Keeper-free settlement via Reactive Network. |
+| Impact | 20% | Turns "trust the manager" into "the manager is whoever is actually winning", and shows on-chain whether that beats a passive benchmark. Depositors get automatic manager replacement plus slashed bonds. Strategists get a permissionless way to prove skill without capital. |
+| Functionality | 15% | 31 passing tests, one-command demo, a full lifecycle with real swaps on a real PoolManager. |
+| Presentation | 10% | Live dashboard: lanes view, standings with sparklines, vault-vs-benchmark report, on-chain event log. |
 
 ## Pitch video script (about 3 minutes)
 
@@ -157,13 +195,15 @@ NAV      = value(position + fees + cash, blockOpenPrice)    // in tUSD
 3. **(0:50) Ranging market.** Click *Trade in a range* twice. Point at Tony's paper NAV climbing faster than Pam's.
 4. **(1:20) Takeover.** *Skip to epoch end* and *Settle*, three times. Call out the qualifying epoch, the streak pips filling, then the takeover message and the vault bar jumping to Tony's range. Show the slashed bond in the event log.
 5. **(2:00) Regime change.** Click *Pump tETH*. Tony's bar goes hatched and Pam leads. "The hook will hand the seat back if this keeps up. Nobody had to vote."
-6. **(2:30) Safety.** Flash the attack/defense table. Mention block-open pricing and the 18 tests.
-7. **(2:50) Close.** "Gauntlet: curation as a competition that settles itself on-chain."
+6. **(2:20) Does it pay?** Point at the Vault panel: vault vs benchmark, since start and this epoch. "Every settlement reports whether the contested seat beat sitting still."
+7. **(2:35) Safety.** Flash the attack/defense table. Mention block-open pricing, blocked donations, the Reactive keeper and the 31 tests.
+8. **(2:50) Close.** "Gauntlet: curation as a competition that settles itself on-chain."
 
 ## Next steps
 
 - Wallet-connected frontend for testnets (the demo uses anvil dev keys)
 - Per-epoch fee-credit caps against wash trading
-- Benchmark-relative performance fees: the seat holder earns a cut only on returns above a passive full-range benchmark (that's the probe trick again)
+- Benchmark-relative performance fees: the seat holder earns a cut only on returns above the benchmark, which the hook already measures
+- Settle against a multi-block price average to close the cross-block push
 - Several vaults per pool with different risk mandates, all reading the same leaderboard
 - Swap-based rebalancing on migration instead of leaving the unmatched side idle

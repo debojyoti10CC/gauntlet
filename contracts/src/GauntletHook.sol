@@ -53,6 +53,8 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
     error ZeroAmount();
     error Slippage();
     error Inactive();
+    error DonationsDisabled();
+    error BenchmarkExists();
 
     event CuratorRegistered(uint256 indexed id, address indexed owner, string name, int24 lower, int24 upper);
     event RangeDeclared(uint256 indexed id, int24 lower, int24 upper, uint256 navAfterCost);
@@ -63,6 +65,9 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
     event VaultMoved(int24 lower, int24 upper, uint128 liquidity);
     event Deposited(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
     event Withdrawn(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
+    event BenchmarkRegistered(uint256 indexed id, string name, int24 lower, int24 upper);
+    /// @notice Per-epoch report card: did the contested vault beat a passive range that never moves?
+    event BenchmarkScored(uint256 indexed epoch, uint256 vaultGrowthWad, uint256 benchmarkGrowthWad);
 
     // ------------------------------------------------------------------
     // Config
@@ -92,6 +97,7 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
         uint32 streak;
         uint32 joinedEpoch;
         bool active;
+        bool benchmark; // passive reference portfolio: never competes, never moves
     }
 
     uint256 public constant INITIAL_NAV = 1_000e18; // every paper portfolio starts with 1,000 token1 of notional
@@ -113,6 +119,12 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
 
     uint256 public epoch;
     uint256 public epochStart;
+
+    // benchmark: a fixed paper portfolio the vault is judged against
+    bool public hasBenchmark;
+    uint256 public benchmarkId;
+    uint256 public vaultStartSharePrice; // share price (WAD, token1 per share) at the first deposit
+    uint256 public vaultEpochStartSharePrice; // share price at the start of the current epoch
 
     // reference price: the pool price at the start of the current block (set on first swap of a block)
     uint160 internal refSqrtPriceStored;
@@ -152,7 +164,7 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
             afterRemoveLiquidity: false,
             beforeSwap: true,
             afterSwap: false,
-            beforeDonate: false,
+            beforeDonate: true, // donations would inflate feeGrowthInside, which is the score
             afterDonate: false,
             beforeSwapReturnDelta: false,
             afterSwapReturnDelta: false,
@@ -289,6 +301,36 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
         emit CuratorExited(id);
     }
 
+    /// @notice Register the pool's benchmark: a passive paper portfolio at a fixed range that never competes,
+    /// never moves and can't be exited. Each epoch the vault's real return is reported against it, so depositors
+    /// can see whether the contested seat is worth more than "just sit in a wide range". One per hook.
+    /// @dev No bond. The caller pays the dust for the probe position (approve both tokens to this contract).
+    function registerBenchmark(string calldata name, int24 lower, int24 upper) external poolReady returns (uint256 id) {
+        if (hasBenchmark) revert BenchmarkExists();
+        _checkRange(lower, upper);
+
+        id = curators.length;
+        curators.push();
+        Curator storage c = curators[id];
+        c.owner = address(0); // nobody can move or exit it
+        c.name = name;
+        c.active = true;
+        c.benchmark = true;
+        c.joinedEpoch = uint32(epoch);
+
+        _moveProbe(id, 0, 0, lower, upper, msg.sender);
+        uint160 p = refSqrtPrice();
+        c.lower = lower;
+        c.upper = upper;
+        c.vL = _liquidityForValue(INITIAL_NAV, lower, upper, p);
+        (c.fg0Last, c.fg1Last) = poolManager.getFeeGrowthInside(poolId, lower, upper);
+        c.epochStartNav = INITIAL_NAV;
+
+        hasBenchmark = true;
+        benchmarkId = id;
+        emit BenchmarkRegistered(id, name, lower, upper);
+    }
+
     /// @notice Close the epoch: score every curator against the incumbent and hand over the vault if a challenger
     /// has won enough epochs in a row. Permissionless.
     function settleEpoch() external poolReady {
@@ -307,6 +349,13 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
             growth[i] = c.epochStartNav == 0 ? WAD : nav * WAD / c.epochStartNav;
         }
 
+        // the vault's real return this epoch, measured before any takeover reshuffles it
+        if (hasBenchmark) {
+            uint256 vsp = _sharePrice(p);
+            uint256 vGrowth = vaultEpochStartSharePrice == 0 ? WAD : vsp * WAD / vaultEpochStartSharePrice;
+            emit BenchmarkScored(epoch, vGrowth, growth[benchmarkId]);
+        }
+
         uint256 incId = incumbentId;
         uint256 gInc = growth[incId];
         uint256 bar = gInc + (gInc * config.marginBps) / 10_000;
@@ -315,7 +364,7 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
         uint256 bestGrowth;
         for (uint256 i; i < n; ++i) {
             Curator storage c = curators[i];
-            if (!c.active || i == incId) continue;
+            if (!c.active || i == incId || c.benchmark) continue;
             // must have been present for the whole epoch to be eligible
             if (c.joinedEpoch < epoch && growth[i] > bar) {
                 c.streak += 1;
@@ -352,6 +401,7 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
             if (!c.active) continue;
             c.epochStartNav = _navOf(c, p);
         }
+        if (totalSupply > 0) vaultEpochStartSharePrice = _sharePrice(p);
         epoch += 1;
         epochStart = block.timestamp;
     }
@@ -461,6 +511,11 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
                 shares = navBefore == 0 ? value : FullMath.mulDiv(value, supply, navBefore);
             }
             _mint(user, shares);
+            if (vaultStartSharePrice == 0) {
+                uint256 sp0 = _sharePrice(p);
+                vaultStartSharePrice = sp0;
+                vaultEpochStartSharePrice = sp0;
+            }
             emit Deposited(user, paid0, paid1, shares);
             return abi.encode(shares);
         }
@@ -514,6 +569,7 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
         uint32 joinedEpoch;
         bool active;
         bool incumbent;
+        bool benchmark;
     }
 
     function curatorCount() external view returns (uint256) {
@@ -540,7 +596,8 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
                 streak: c.streak,
                 joinedEpoch: c.joinedEpoch,
                 active: c.active,
-                incumbent: hasIncumbent && i == incumbentId
+                incumbent: hasIncumbent && i == incumbentId,
+                benchmark: c.benchmark
             });
         }
     }
@@ -553,13 +610,32 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
     /// @notice Total vault value in token1 at the reference price, including uncollected fees.
     function vaultNav() public view returns (uint256) {
         if (!poolSet) return 0;
+        return _vaultNavWithFees(refSqrtPrice());
+    }
+
+    /// @notice Vault vs benchmark, both as growth multipliers (WAD, 1e18 = flat).
+    /// @return vaultSinceStart share price now / share price at the first deposit
+    /// @return vaultThisEpoch share price now / share price at epoch start
+    /// @return benchSinceStart benchmark paper NAV now / INITIAL_NAV
+    /// @return benchThisEpoch benchmark paper NAV now / its NAV at epoch start
+    function benchmarkReport()
+        external
+        view
+        returns (uint256 vaultSinceStart, uint256 vaultThisEpoch, uint256 benchSinceStart, uint256 benchThisEpoch)
+    {
+        if (!poolSet) return (WAD, WAD, WAD, WAD);
         uint160 p = refSqrtPrice();
-        uint256 nav = _vaultNav(p);
-        if (vaultLiquidity > 0) {
-            (uint256 f0, uint256 f1) = _pendingVaultFees();
-            nav += _value(f0, f1, p);
+        uint256 sp = _sharePrice(p);
+        vaultSinceStart = vaultStartSharePrice == 0 ? WAD : sp * WAD / vaultStartSharePrice;
+        vaultThisEpoch = vaultEpochStartSharePrice == 0 ? WAD : sp * WAD / vaultEpochStartSharePrice;
+        if (hasBenchmark) {
+            Curator storage b = curators[benchmarkId];
+            uint256 nav = _navOf(b, p);
+            benchSinceStart = nav * WAD / INITIAL_NAV;
+            benchThisEpoch = b.epochStartNav == 0 ? WAD : nav * WAD / b.epochStartNav;
+        } else {
+            (benchSinceStart, benchThisEpoch) = (WAD, WAD);
         }
-        return nav;
     }
 
     function vaultState()
@@ -647,6 +723,21 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
     function _vaultNav(uint160 p) internal view returns (uint256) {
         (uint256 a0, uint256 a1) = _amountsForLiquidity(p, vaultLower, vaultUpper, vaultLiquidity);
         return _value(a0 + idle0, a1 + idle1, p);
+    }
+
+    function _vaultNavWithFees(uint160 p) internal view returns (uint256 nav) {
+        nav = _vaultNav(p);
+        if (vaultLiquidity > 0) {
+            (uint256 f0, uint256 f1) = _pendingVaultFees();
+            nav += _value(f0, f1, p);
+        }
+    }
+
+    /// @dev token1 value of one vault share (WAD), fees included
+    function _sharePrice(uint160 p) internal view returns (uint256) {
+        uint256 supply = totalSupply;
+        if (supply == 0) return WAD;
+        return FullMath.mulDiv(_vaultNavWithFees(p), WAD, supply);
     }
 
     function _pendingVaultFees() internal view returns (uint256 f0, uint256 f1) {
@@ -757,7 +848,7 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
 
     function _activeCount() internal view returns (uint256 k) {
         for (uint256 i; i < curators.length; ++i) {
-            if (curators[i].active) ++k;
+            if (curators[i].active && !curators[i].benchmark) ++k;
         }
     }
 
@@ -814,8 +905,10 @@ contract GauntletHook is IHooks, IUnlockCallback, ERC20 {
         revert HookNotImplemented();
     }
 
+    /// @dev `donate()` adds to feeGrowthGlobal for every in-range position without a swap. Curator scores are
+    /// read from feeGrowthInside, so a donation could pump a tight range's paper NAV for free. Block them.
     function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
-        revert HookNotImplemented();
+        revert DonationsDisabled();
     }
 
     function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {

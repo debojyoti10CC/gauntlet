@@ -25,7 +25,7 @@ import {
   tickToPrice,
   toWad,
 } from "./lib/math";
-import { Lanes, laneColor, type CuratorRow } from "./Lanes";
+import { Lanes, colorOf, type CuratorRow } from "./Lanes";
 
 type Config = {
   epochLength: number;
@@ -43,6 +43,8 @@ type Snapshot = {
   epoch: { current: number; start: number; end: number; now: number; fetchedAt: number };
   me: { shares: bigint; eth: bigint; usd: bigint };
   config: Config;
+  // growth multipliers, 1 = flat
+  bench: { vaultSince: number; vaultEpoch: number; benchSince: number; benchEpoch: number };
 };
 
 type LogItem = { key: string; block: bigint; text: string; tone?: "win" | "plain" };
@@ -66,7 +68,7 @@ export default function App() {
     if (!dep) return;
     try {
       const me = addressOf(actor);
-      const [curators, vs, ei, sp, cfg, shares, eth, usd] = await Promise.all([
+      const [curators, vs, ei, sp, cfg, shares, eth, usd, br] = await Promise.all([
         publicClient.readContract({ address: dep.hook, abi: HOOK_ABI, functionName: "getCurators" }),
         publicClient.readContract({ address: dep.hook, abi: HOOK_ABI, functionName: "vaultState" }),
         publicClient.readContract({ address: dep.hook, abi: HOOK_ABI, functionName: "epochInfo" }),
@@ -75,7 +77,9 @@ export default function App() {
         publicClient.readContract({ address: dep.hook, abi: HOOK_ABI, functionName: "balanceOf", args: [me] }),
         publicClient.readContract({ address: dep.token0, abi: ERC20_ABI, functionName: "balanceOf", args: [me] }),
         publicClient.readContract({ address: dep.token1, abi: ERC20_ABI, functionName: "balanceOf", args: [me] }),
+        publicClient.readContract({ address: dep.hook, abi: HOOK_ABI, functionName: "benchmarkReport" }),
       ]);
+      const b = br as bigint[];
       const v = vs as any[];
       const e = ei as any[];
       const c = cfg as any[];
@@ -93,6 +97,7 @@ export default function App() {
         joinedEpoch: Number(r.joinedEpoch),
         active: r.active,
         incumbent: r.incumbent,
+        benchmark: r.benchmark,
       }));
       setSnap({
         price: sqrtPriceToPrice(sp as bigint),
@@ -108,6 +113,7 @@ export default function App() {
           slashBps: Number(c[4]),
           minBond: c[6],
         },
+        bench: { vaultSince: fromWad(b[0]), vaultEpoch: fromWad(b[1]), benchSince: fromWad(b[2]), benchEpoch: fromWad(b[3]) },
       });
       setHistory((h) => {
         const next = { ...h };
@@ -318,6 +324,7 @@ export default function App() {
   }
 
   const incumbent = snap.curators.find((c) => c.incumbent);
+  const benchmark = snap.curators.find((c) => c.benchmark && c.active);
   const log = events.map(describe).filter(Boolean).reverse().slice(0, 14) as LogItem[];
   const chainNow = snap.epoch.now + Math.floor((Date.now() - snap.epoch.fetchedAt) / 1000);
   const remaining = snap.epoch.end - chainNow;
@@ -344,7 +351,7 @@ export default function App() {
           </div>
           <div>
             <dt>Seat holder</dt>
-            <dd style={{ color: incumbent ? laneColor(incumbent.id) : undefined }}>{incumbent?.name ?? "nobody"}</dd>
+            <dd style={{ color: incumbent ? colorOf(incumbent) : undefined }}>{incumbent?.name ?? "nobody"}</dd>
           </div>
         </dl>
         <label className="actor">
@@ -412,27 +419,32 @@ export default function App() {
                 .map((c) => (
                   <tr key={c.id} className={c.incumbent ? "is-seat" : ""}>
                     <td>
-                      <span className="dot" style={{ background: laneColor(c.id) }} />
+                      <span className="dot" style={{ background: colorOf(c) }} />
                       {c.name}
                       {c.incumbent && <span className="badge">seat</span>}
-                      {!c.incumbent && c.joinedEpoch >= snap.epoch.current && <span className="badge soft">qualifying</span>}
+                      {c.benchmark && <span className="badge soft">benchmark</span>}
+                      {!c.incumbent && !c.benchmark && c.joinedEpoch >= snap.epoch.current && (
+                        <span className="badge soft">qualifying</span>
+                      )}
                     </td>
                     <td className="range">
                       {fmt(tickToPrice(c.lower), 0)} to {fmt(tickToPrice(c.upper), 0)}
                     </td>
                     <td className="num">
-                      <Spark values={history[c.id] ?? []} color={laneColor(c.id)} />
+                      <Spark values={history[c.id] ?? []} color={colorOf(c)} />
                       {fmt(fromWad(c.nav), 2)}
                     </td>
                     <td className="num">{fmtPct(fromWad(c.epochGrowthWad) - 1, 3)}</td>
                     <td>
                       {c.incumbent ? (
                         <span className="muted">defending</span>
+                      ) : c.benchmark ? (
+                        <span className="muted">passive</span>
                       ) : (
-                        <Pips filled={c.streak} total={snap.config.winStreak} color={laneColor(c.id)} />
+                        <Pips filled={c.streak} total={snap.config.winStreak} color={colorOf(c)} />
                       )}
                     </td>
-                    <td className="num">{fmt(fromWad(c.bond), 0)}</td>
+                    <td className="num">{c.benchmark ? "–" : fmt(fromWad(c.bond), 0)}</td>
                   </tr>
                 ))}
             </tbody>
@@ -464,6 +476,7 @@ export default function App() {
             Managed by {incumbent?.name ?? "nobody"} at {fmt(tickToPrice(snap.vault.lower), 0)} to{" "}
             {fmt(tickToPrice(snap.vault.upper), 0)}. Wallet: {fmt(fromWad(snap.me.eth), 2)} tETH, {fmt(fromWad(snap.me.usd), 0)} tUSD.
           </p>
+          {benchmark && <BenchCompare bench={snap.bench} name={benchmark.name} />}
           <DepositForm busy={!!busy} onDeposit={deposit} />
           <div className="row">
             <span className="muted small">Withdraw</span>
@@ -509,6 +522,18 @@ export default function App() {
         return { key, block, text: `${a.name} entered at ${fmt(tickToPrice(Number(a.lower)), 0)} to ${fmt(tickToPrice(Number(a.upper)), 0)}.` };
       case "RangeDeclared":
         return { key, block, text: `${name(a.id)} moved to ${fmt(tickToPrice(Number(a.lower)), 0)} to ${fmt(tickToPrice(Number(a.upper)), 0)}.` };
+      case "BenchmarkRegistered":
+        return { key, block, text: `Benchmark set at ${fmt(tickToPrice(Number(a.lower)), 0)} to ${fmt(tickToPrice(Number(a.upper)), 0)}. It never moves.` };
+      case "BenchmarkScored": {
+        const v = fromWad(a.vaultGrowthWad) - 1;
+        const bm = fromWad(a.benchmarkGrowthWad) - 1;
+        return {
+          key,
+          block,
+          tone: v > bm ? "win" : "plain",
+          text: `Epoch ${a.epoch} report: vault ${fmtPct(v, 3)} vs benchmark ${fmtPct(bm, 3)}.`,
+        };
+      }
       case "CuratorExited":
         return { key, block, text: `${name(a.id)} left the gauntlet.` };
       case "Deposited":
@@ -539,6 +564,44 @@ function Figure({ label, value }: { label: string; value: string }) {
     <div className="figure">
       <span className="muted small">{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function BenchCompare({ bench, name }: { bench: Snapshot["bench"]; name: string }) {
+  const rows = [
+    { label: "Since start", v: bench.vaultSince - 1, b: bench.benchSince - 1 },
+    { label: "This epoch", v: bench.vaultEpoch - 1, b: bench.benchEpoch - 1 },
+  ];
+  return (
+    <div className="bench">
+      <table>
+        <thead>
+          <tr>
+            <th />
+            <th className="num">Vault</th>
+            <th className="num">Benchmark</th>
+            <th className="num">Edge</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => {
+            const edge = r.v - r.b;
+            return (
+              <tr key={r.label}>
+                <td>{r.label}</td>
+                <td className="num">{fmtPct(r.v, 3)}</td>
+                <td className="num">{fmtPct(r.b, 3)}</td>
+                <td className={`num edge ${edge > 0.000005 ? "pos" : edge < -0.000005 ? "neg" : ""}`}>{fmtPct(edge, 3)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="muted small">
+        {name}: the same 1,000 tUSD paper portfolio as the curators, parked on a fixed wide range. If the contested seat
+        isn't beating it, depositors would be better off passive.
+      </p>
     </div>
   );
 }
@@ -668,7 +731,7 @@ function RangeEditor({
   return (
     <div className="stack">
       <p>
-        <span className="dot" style={{ background: laneColor(c.id) }} />
+        <span className="dot" style={{ background: colorOf(c) }} />
         <strong>{c.name}</strong> {c.incumbent ? "holds the seat. Moving your range moves the vault." : "is challenging."}
       </p>
       <p className="muted small">

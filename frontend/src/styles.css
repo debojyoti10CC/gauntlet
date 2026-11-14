@@ -176,3 +176,11 @@ tr.is-seat td { background: #eef2f6; }
 @media (prefers-reduced-motion: reduce) {
   .lanes rect, .lanes .vault-bar { transition: none; }
 }
+
+/* ---------- vault vs benchmark */
+.bench { margin: 4px 0 10px; }
+.bench table { margin-top: 0; }
+.bench td, .bench th { padding: 6px 6px; }
+.bench .edge.pos { color: var(--win); font-weight: 700; }
+.bench .edge.neg { color: var(--err); font-weight: 700; }
+.bench p { margin-top: 6px; }

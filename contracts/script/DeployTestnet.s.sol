@@ -62,7 +62,7 @@ contract DeployTestnet is Script {
             maxTickDeviation: 300,
             minBond: 100e18
         });
-        uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG);
+        uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_DONATE_FLAG);
         bytes memory hookInit = abi.encodePacked(type(GauntletHook).creationCode, abi.encode(manager, cfg));
         bytes32 hookSalt;
         for (uint256 s;; ++s) {
@@ -99,6 +99,7 @@ contract DeployTestnet is Script {
             ""
         );
         hook.register("Genesis", 74880, 83400, 500e18);
+        hook.registerBenchmark("Benchmark", START_TICK - 6960, START_TICK + 4080);
         hook.deposit(50e18, 150_000e18, 0);
         vm.stopBroadcast();
 

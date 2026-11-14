@@ -14,6 +14,9 @@ fi
 if [ ! -d "$ROOT/contracts/lib/forge-std" ]; then
   (cd "$ROOT/contracts" && forge install foundry-rs/forge-std --no-git)
 fi
+if [ ! -d "$ROOT/contracts/lib/reactive-lib" ]; then
+  (cd "$ROOT/contracts" && forge install Reactive-Network/reactive-lib --no-git)
+fi
 
 echo "Starting anvil on :$PORT_RPC"
 pkill -f "anvil --port $PORT_RPC" 2>/dev/null || true

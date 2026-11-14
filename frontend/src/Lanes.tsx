@@ -14,10 +14,13 @@ export type CuratorRow = {
   joinedEpoch: number;
   active: boolean;
   incumbent: boolean;
+  benchmark: boolean;
 };
 
 export const LANE_COLORS = ["#C8871A", "#2C8C7A", "#7B4FC9", "#C24B5A", "#3D7BD9", "#6E8A2A", "#B5568F", "#4F6B8A"];
+export const BENCH_COLOR = "#8A96A3";
 export const laneColor = (id: number) => LANE_COLORS[id % LANE_COLORS.length];
+export const colorOf = (c: { id: number; benchmark?: boolean }) => (c.benchmark ? BENCH_COLOR : laneColor(c.id));
 
 type Props = {
   curators: CuratorRow[];
@@ -32,7 +35,10 @@ const W = 1040;
 
 export function Lanes({ curators, price, vault }: Props) {
   const active = curators.filter((c) => c.active);
-  const sorted = [...active].sort((a, b) => Number(b.incumbent) - Number(a.incumbent) || a.id - b.id);
+  // seat holder first, benchmark last, everyone else by id
+  const sorted = [...active].sort(
+    (a, b) => Number(b.incumbent) - Number(a.incumbent) || Number(a.benchmark) - Number(b.benchmark) || a.id - b.id,
+  );
 
   const prices = active.flatMap((c) => [tickToPrice(c.lower), tickToPrice(c.upper)]);
   if (price > 0) prices.push(price);
@@ -95,16 +101,16 @@ export function Lanes({ curators, price, vault }: Props) {
         const pu = tickToPrice(c.upper);
         const inRange = price >= pl && price <= pu;
         const g = fromWad(c.epochGrowthWad);
-        const color = laneColor(c.id);
+        const color = colorOf(c);
         const y0 = top + (i + 1) * ROW;
-        const lead = !c.incumbent && g - incGrowth > 0.00005;
+        const lead = !c.incumbent && !c.benchmark && g - incGrowth > 0.00005;
         return (
           <g key={c.id} transform={`translate(0, ${y0})`} style={{ color }}>
             <text x={12} y={ROW / 2 + 1} className="lane-name">
               {c.name}
             </text>
             <text x={12} y={ROW / 2 + 16} className="lane-sub">
-              {c.incumbent ? "holds the seat" : streakText(c.streak)}
+              {c.incumbent ? "holds the seat" : c.benchmark ? "never moves" : streakText(c.streak)}
             </text>
             <rect
               x={clampX(pl)}
