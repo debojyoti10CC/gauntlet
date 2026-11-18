@@ -8,3 +8,5 @@ contracts/deployments/*.json
 !contracts/deployments/.gitkeep
 frontend/public/deployments.json
 frontend/*.tsbuildinfo
+.DS_Store
+Thumbs.db
