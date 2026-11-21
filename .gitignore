@@ -10,3 +10,5 @@ frontend/public/deployments.json
 frontend/*.tsbuildinfo
 .DS_Store
 Thumbs.db
+.env
+.env.local
